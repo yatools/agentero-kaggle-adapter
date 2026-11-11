@@ -9,6 +9,7 @@ paths = {
     'system_one.rs':'crates/agentero-core/src/decision/providers/system_one.rs',
     'updater.rs':'src-tauri/src/features/system/updater.rs',
     'core-Cargo.toml':'crates/agentero-core/Cargo.toml',
+    'tauri.conf.json':'src-tauri/tauri.conf.json',
 }
 diffs=[]
 for name,path in paths.items():
@@ -16,11 +17,18 @@ for name,path in paths.items():
     new=old
     if name=='service.rs':
         new=new.replace('const JEV_CONCURRENCY: usize = 16;','const JEV_CONCURRENCY: usize = 1;')
-        new=new.replace('let resp = provider.complete(request).await?;', '''let resp = tokio::select! {
+        new=new.replace('const JEV_CONCURRENCY: usize = 1;', 'const JEV_CONCURRENCY: usize = 1;\nstatic HIGHLIGHT_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);')
+        new=new.replace('let resp = provider.complete(request).await?;', '''let permit = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => return Err(AppError::message("jEV smart highlight cancelled")),
+                    permit = HIGHLIGHT_GATE.acquire() => permit.map_err(|_| AppError::message("highlight queue unavailable"))?,
+                };
+                let resp = tokio::select! {
                     biased;
                     _ = cancel_token.cancelled() => return Err(AppError::message("jEV smart highlight cancelled")),
                     result = provider.complete(request) => result?,
-                };''')
+                };
+                drop(permit);''')
         new=new.replace('.unwrap_or(0.0);', '''.filter(|value| value.is_finite() && (0.0..=3.0).contains(value))
                             .ok_or_else(|| AppError::message(format!("Invalid or missing decision score: {qid}")))?;''')
         start=new.index('    let total_batches = sentences.chunks(BATCH_SIZE).len();')
@@ -51,6 +59,9 @@ for name,path in paths.items():
         new+='\n'+(ROOT/'scripts/transport_tests.rs').read_text(encoding='utf-8')
     elif name=='core-Cargo.toml':
         new=new.replace('features = ["macros", "rt", "fs"]','features = ["macros", "rt", "fs", "test-util", "net"]')
+    elif name=='tauri.conf.json':
+        new=new.replace('"title": "Agentero"','"title": "Agentero - Kaggle Adapter"')
+        new=new.replace('"createUpdaterArtifacts": true','"createUpdaterArtifacts": false')
     else:
         start=new.index('    let mut builder = webview.updater_builder()')
         new=new[:start]+'''    // This portable build is updated from its reproducible adapter repository.

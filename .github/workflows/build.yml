@@ -46,6 +46,13 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt
       - uses: ilammy/msvc-dev-cmd@v1
+      - name: Cache downloaded Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-downloads-windows-1.99.1-v1
       - name: Prepare frontend and native resources
         working-directory: upstream
         shell: pwsh
@@ -67,13 +74,13 @@ jobs:
         working-directory: upstream
         shell: pwsh
         run: |
-          cargo test --locked -p agentero-core kaggle_transport_tests -- --nocapture --test-threads=1
+          cargo test --release --locked -p agentero-core kaggle_transport_tests -- --nocapture --test-threads=1
           if ($LASTEXITCODE) { throw 'Transport tests failed' }
       - name: Test serial batches, cancellation and errors
         working-directory: upstream
         shell: pwsh
         run: |
-          cargo test --locked -p agentero kaggle_tests --lib -- --nocapture --test-threads=1
+          cargo test --release --locked -p agentero kaggle_tests --lib -- --nocapture --test-threads=1
           if ($LASTEXITCODE) { throw 'Highlight tests failed' }
       - name: Build portable desktop application
         working-directory: upstream

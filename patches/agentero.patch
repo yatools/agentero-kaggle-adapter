@@ -1,15 +1,16 @@
 --- a/src-tauri/src/features/jev/service.rs
 +++ b/src-tauri/src/features/jev/service.rs
-@@ -17,7 +17,7 @@
+@@ -17,7 +17,8 @@
  use tokio_util::sync::CancellationToken;
  
  const BATCH_SIZE: usize = 32;
 -const JEV_CONCURRENCY: usize = 16;
 +const JEV_CONCURRENCY: usize = 1;
++static HIGHLIGHT_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
  const MIN_SENTENCE_LEN: usize = 40;
  const MAX_SENTENCE_LEN: usize = 250;
  const SCORE_THRESHOLD: f64 = 2.0;
-@@ -206,18 +206,13 @@
+@@ -206,18 +207,13 @@
      provider.complete(request).await.map(|_| ())
  }
  
@@ -31,20 +32,26 @@
      let total_batches = sentences.chunks(BATCH_SIZE).len();
      let on_progress = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
      let completed_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-@@ -253,7 +248,11 @@
+@@ -253,7 +249,17 @@
                      "questions": questions,
                  });
  
 -                let resp = provider.complete(request).await?;
++                let permit = tokio::select! {
++                    biased;
++                    _ = cancel_token.cancelled() => return Err(AppError::message("jEV smart highlight cancelled")),
++                    permit = HIGHLIGHT_GATE.acquire() => permit.map_err(|_| AppError::message("highlight queue unavailable"))?,
++                };
 +                let resp = tokio::select! {
 +                    biased;
 +                    _ = cancel_token.cancelled() => return Err(AppError::message("jEV smart highlight cancelled")),
 +                    result = provider.complete(request) => result?,
 +                };
++                drop(permit);
                  let answers = resp
                      .get("answers")
                      .and_then(|a| a.as_object())
-@@ -269,7 +268,8 @@
+@@ -269,7 +275,8 @@
                              .get(&qid)
                              .and_then(|a| a.get("score"))
                              .and_then(|v| v.as_f64())
@@ -54,7 +61,7 @@
                          scores.insert(key.to_string(), score);
                      }
  
-@@ -290,14 +290,24 @@
+@@ -290,14 +297,24 @@
          .try_collect()
          .await?;
  
@@ -85,7 +92,7 @@
  
      // Phase 2: build highlights from the pre-computed sentence geometry.
      // No second PDF locate pass is needed because extract_text_in_pdf already
-@@ -341,3 +351,150 @@
+@@ -341,3 +358,187 @@
  ) -> Result<Vec<SuggestedHighlight>, AppError> {
      jev_suggest_highlights_impl(provider.clone(), pdf_path, title, cancel_token, on_progress).await
  }
@@ -217,6 +224,43 @@
 +            while api.active.load(Ordering::SeqCst)!=0 { tokio::time::sleep(Duration::from_millis(10)).await; }
 +        }).await.unwrap();
 +        assert_eq!(api.calls.load(Ordering::SeqCst),1);
++    }
++
++    #[tokio::test]
++    async fn independent_paper_jobs_share_one_global_request_slot() {
++        let api = MockApi::start(Duration::from_millis(50),"ok").await;
++        let mut jobs=Vec::new();
++        for _ in 0..4 {
++            let provider=api.provider();
++            jobs.push(tokio::spawn(async move {
++                score_sentence_batches(provider,sentences(32),"Synthetic paper",&CancellationToken::new(),|_,_|{}).await
++            }));
++        }
++        for job in jobs {assert_eq!(job.await.unwrap().unwrap().len(),32);}
++        assert_eq!(api.calls.load(Ordering::SeqCst),4);
++        assert_eq!(api.peak.load(Ordering::SeqCst),1);
++    }
++
++    #[tokio::test]
++    async fn cancellation_while_queued_sends_no_request() {
++        let api = MockApi::start(Duration::from_secs(30),"ok").await;
++        let first_token=CancellationToken::new();
++        let first_cancel=first_token.clone();
++        let provider=api.provider();
++        let first=tokio::spawn(async move {score_sentence_batches(provider,sentences(32),"Synthetic paper",&first_cancel,|_,_|{}).await});
++        tokio::time::timeout(Duration::from_secs(3),async {
++            while api.calls.load(Ordering::SeqCst)==0 {tokio::time::sleep(Duration::from_millis(10)).await;}
++        }).await.unwrap();
++        let second_token=CancellationToken::new();
++        let second_cancel=second_token.clone();
++        let provider=api.provider();
++        let second=tokio::spawn(async move {score_sentence_batches(provider,sentences(32),"Synthetic paper",&second_cancel,|_,_|{}).await});
++        tokio::time::sleep(Duration::from_millis(30)).await;
++        second_token.cancel();
++        assert!(tokio::time::timeout(Duration::from_secs(1),second).await.unwrap().unwrap().is_err());
++        assert_eq!(api.calls.load(Ordering::SeqCst),1);
++        first_token.cancel();
++        assert!(first.await.unwrap().is_err());
 +    }
 +
 +    #[tokio::test]
@@ -412,3 +456,23 @@
  # Unique temp-dir names in `fs::path` tests.
  uuid = { version = "1", features = ["v4"] }
  
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -12,7 +12,7 @@
+   "app": {
+     "windows": [
+       {
+-        "title": "Agentero",
++        "title": "Agentero - Kaggle Adapter",
+         "dragDropEnabled": false,
+         "width": 1280,
+         "height": 800,
+@@ -54,7 +54,7 @@
+   },
+   "bundle": {
+     "active": true,
+-    "createUpdaterArtifacts": true,
++    "createUpdaterArtifacts": false,
+     "targets": "all",
+     "category": "Productivity",
+     "externalBin": ["binaries/agentero-plugin-host"],

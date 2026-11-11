@@ -128,6 +128,43 @@ mod kaggle_tests {
     }
 
     #[tokio::test]
+    async fn independent_paper_jobs_share_one_global_request_slot() {
+        let api = MockApi::start(Duration::from_millis(50),"ok").await;
+        let mut jobs=Vec::new();
+        for _ in 0..4 {
+            let provider=api.provider();
+            jobs.push(tokio::spawn(async move {
+                score_sentence_batches(provider,sentences(32),"Synthetic paper",&CancellationToken::new(),|_,_|{}).await
+            }));
+        }
+        for job in jobs {assert_eq!(job.await.unwrap().unwrap().len(),32);}
+        assert_eq!(api.calls.load(Ordering::SeqCst),4);
+        assert_eq!(api.peak.load(Ordering::SeqCst),1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_queued_sends_no_request() {
+        let api = MockApi::start(Duration::from_secs(30),"ok").await;
+        let first_token=CancellationToken::new();
+        let first_cancel=first_token.clone();
+        let provider=api.provider();
+        let first=tokio::spawn(async move {score_sentence_batches(provider,sentences(32),"Synthetic paper",&first_cancel,|_,_|{}).await});
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while api.calls.load(Ordering::SeqCst)==0 {tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        let second_token=CancellationToken::new();
+        let second_cancel=second_token.clone();
+        let provider=api.provider();
+        let second=tokio::spawn(async move {score_sentence_batches(provider,sentences(32),"Synthetic paper",&second_cancel,|_,_|{}).await});
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        second_token.cancel();
+        assert!(tokio::time::timeout(Duration::from_secs(1),second).await.unwrap().unwrap().is_err());
+        assert_eq!(api.calls.load(Ordering::SeqCst),1);
+        first_token.cancel();
+        assert!(first.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
     async fn pre_cancelled_job_sends_nothing() {
         let api = MockApi::start(Duration::ZERO, "ok").await;
         let token = CancellationToken::new(); token.cancel();
