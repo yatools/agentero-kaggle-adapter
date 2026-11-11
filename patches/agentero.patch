@@ -1,0 +1,415 @@
+--- a/src-tauri/src/features/jev/service.rs
++++ b/src-tauri/src/features/jev/service.rs
+@@ -17,7 +17,7 @@
+ use tokio_util::sync::CancellationToken;
+ 
+ const BATCH_SIZE: usize = 32;
+-const JEV_CONCURRENCY: usize = 16;
++const JEV_CONCURRENCY: usize = 1;
+ const MIN_SENTENCE_LEN: usize = 40;
+ const MAX_SENTENCE_LEN: usize = 250;
+ const SCORE_THRESHOLD: f64 = 2.0;
+@@ -206,18 +206,13 @@
+     provider.complete(request).await.map(|_| ())
+ }
+ 
+-async fn jev_suggest_highlights_impl<F: FnMut(usize, usize) + Send>(
++async fn score_sentence_batches<F: FnMut(usize, usize) + Send>(
+     provider: Arc<SystemOneProvider>,
+-    pdf_path: &Path,
++    sentences: Vec<Sentence>,
+     title: &str,
+     cancel_token: &CancellationToken,
+     on_progress: F,
+-) -> Result<Vec<SuggestedHighlight>, AppError> {
+-    let sentences = extract_paper_sentences(pdf_path);
+-    if sentences.is_empty() {
+-        return Err(AppError::message("jevNoReadableText"));
+-    }
+-
++) -> Result<Vec<(Sentence, HighlightDecision)>, AppError> {
+     let total_batches = sentences.chunks(BATCH_SIZE).len();
+     let on_progress = std::sync::Arc::new(std::sync::Mutex::new(on_progress));
+     let completed_batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+@@ -253,7 +248,11 @@
+                     "questions": questions,
+                 });
+ 
+-                let resp = provider.complete(request).await?;
++                let resp = tokio::select! {
++                    biased;
++                    _ = cancel_token.cancelled() => return Err(AppError::message("jEV smart highlight cancelled")),
++                    result = provider.complete(request) => result?,
++                };
+                 let answers = resp
+                     .get("answers")
+                     .and_then(|a| a.as_object())
+@@ -269,7 +268,8 @@
+                             .get(&qid)
+                             .and_then(|a| a.get("score"))
+                             .and_then(|v| v.as_f64())
+-                            .unwrap_or(0.0);
++                            .filter(|value| value.is_finite() && (0.0..=3.0).contains(value))
++                            .ok_or_else(|| AppError::message(format!("Invalid or missing decision score: {qid}")))?;
+                         scores.insert(key.to_string(), score);
+                     }
+ 
+@@ -290,14 +290,24 @@
+         .try_collect()
+         .await?;
+ 
+-    // Sort by batch index so output order is deterministic.
+     let mut scored_batches = scored_batches;
+     scored_batches.sort_by_key(|(idx, _)| *idx);
+-
+-    let scored_sentences: Vec<(Sentence, HighlightDecision)> = scored_batches
+-        .into_iter()
+-        .flat_map(|(_, decisions)| decisions)
+-        .collect();
++    Ok(scored_batches.into_iter().flat_map(|(_, decisions)| decisions).collect())
++}
++
++async fn jev_suggest_highlights_impl<F: FnMut(usize, usize) + Send>(
++    provider: Arc<SystemOneProvider>,
++    pdf_path: &Path,
++    title: &str,
++    cancel_token: &CancellationToken,
++    on_progress: F,
++) -> Result<Vec<SuggestedHighlight>, AppError> {
++    let sentences = extract_paper_sentences(pdf_path);
++    if sentences.is_empty() {
++        return Err(AppError::message("jevNoReadableText"));
++    }
++
++    let scored_sentences = score_sentence_batches(provider, sentences, title, cancel_token, on_progress).await?;
+ 
+     // Phase 2: build highlights from the pre-computed sentence geometry.
+     // No second PDF locate pass is needed because extract_text_in_pdf already
+@@ -342,3 +352,150 @@
+     jev_suggest_highlights_impl(provider.clone(), pdf_path, title, cancel_token, on_progress).await
+ }
+ 
++
++
++#[cfg(test)]
++mod kaggle_tests {
++    use super::*;
++    use crate::core::decision::SystemOneCredentials;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::Mutex;
++    use std::time::Duration;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    struct MockApi {
++        endpoint: String,
++        calls: Arc<AtomicUsize>,
++        active: Arc<AtomicUsize>,
++        peak: Arc<AtomicUsize>,
++        bodies: Arc<Mutex<Vec<Value>>>,
++        task: tokio::task::JoinHandle<()>,
++    }
++
++    impl Drop for MockApi {
++        fn drop(&mut self) { self.task.abort(); }
++    }
++
++    struct Active(Arc<AtomicUsize>);
++    impl Drop for Active {
++        fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
++    }
++
++    impl MockApi {
++        async fn start(delay: Duration, mode: &'static str) -> Self {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
++            let calls = Arc::new(AtomicUsize::new(0));
++            let active = Arc::new(AtomicUsize::new(0));
++            let peak = Arc::new(AtomicUsize::new(0));
++            let bodies = Arc::new(Mutex::new(Vec::new()));
++            let (c, a, p, b) = (calls.clone(), active.clone(), peak.clone(), bodies.clone());
++            let task = tokio::spawn(async move {
++                while let Ok((mut socket, _)) = listener.accept().await {
++                    let (c, a, p, b) = (c.clone(), a.clone(), p.clone(), b.clone());
++                    tokio::spawn(async move {
++                        let mut raw = Vec::new();
++                        let body = loop {
++                            let mut buf = [0; 8192];
++                            let n = socket.read(&mut buf).await.unwrap_or(0);
++                            if n == 0 { return; }
++                            raw.extend_from_slice(&buf[..n]);
++                            if let Some(header_end) = raw.windows(4).position(|x| x == b"\r\n\r\n") {
++                                let headers = String::from_utf8_lossy(&raw[..header_end]).to_lowercase();
++                                let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
++                                if raw.len() >= header_end + 4 + len {
++                                    break serde_json::from_slice::<Value>(&raw[header_end+4..header_end+4+len]).unwrap();
++                                }
++                            }
++                        };
++                        b.lock().unwrap().push(body.clone());
++                        c.fetch_add(1, Ordering::SeqCst);
++                        let current = a.fetch_add(1, Ordering::SeqCst) + 1;
++                        p.fetch_max(current, Ordering::SeqCst);
++                        let _guard = Active(a);
++                        let mut closed = [0; 1];
++                        tokio::select! {
++                            _ = tokio::time::sleep(delay) => {},
++                            _ = socket.read(&mut closed) => { return; }
++                        }
++                        let mut answers = serde_json::Map::new();
++                        if mode != "missing" {
++                            for id in body["questions"].as_object().unwrap().keys() {
++                                answers.insert(id.clone(), serde_json::json!({"score": 3.0}));
++                            }
++                        }
++                        let response = serde_json::json!({"answers":answers}).to_string();
++                        let status = if mode == "error" { "400 Bad Request" } else { "200 OK" };
++                        let bytes = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response);
++                        let _ = socket.write_all(bytes.as_bytes()).await;
++                    });
++                }
++            });
++            Self {endpoint, calls, active, peak, bodies, task}
++        }
++
++        fn provider(&self) -> Arc<SystemOneProvider> {
++            let endpoint = self.endpoint.clone();
++            Arc::new(SystemOneProvider::new(reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap(), move || {
++                Ok(SystemOneCredentials {api_key:"synthetic-test-only".into(), base_url:endpoint.clone(), model:"elephant-1".into()})
++            }))
++        }
++    }
++
++    fn sentences(count: usize) -> Vec<Sentence> {
++        (0..count).map(|i| Sentence {id:format!("s{i}"), text:format!("Synthetic experiment {i} describes an important method and its measured effect."), page:1, rects:vec![], page_width:600.0, page_height:800.0}).collect()
++    }
++
++    #[tokio::test]
++    async fn sixteen_batches_are_serial_and_complete_in_order() {
++        let api = MockApi::start(Duration::from_millis(20), "ok").await;
++        let progress = Arc::new(Mutex::new(Vec::new()));
++        let log = progress.clone();
++        let result = score_sentence_batches(api.provider(), sentences(512), "Synthetic paper", &CancellationToken::new(), move |done,total| log.lock().unwrap().push((done,total))).await.unwrap();
++        assert_eq!(api.calls.load(Ordering::SeqCst),16);
++        assert_eq!(api.peak.load(Ordering::SeqCst),1);
++        assert_eq!(result.len(),512);
++        assert_eq!(result[0].0.id,"s0");
++        assert_eq!(result[511].0.id,"s511");
++        assert_eq!(*progress.lock().unwrap(),(1..=16).map(|n|(n,16)).collect::<Vec<_>>());
++        for body in api.bodies.lock().unwrap().iter() {
++            assert_eq!(body["state"]["sentences"].as_object().unwrap().len(),32);
++            assert_eq!(body["questions"].as_object().unwrap().len(),160);
++        }
++    }
++
++    #[tokio::test]
++    async fn cancel_interrupts_active_request_and_never_starts_queued_batches() {
++        let api = MockApi::start(Duration::from_secs(30), "ok").await;
++        let token = CancellationToken::new();
++        let task_token = token.clone();
++        let provider = api.provider();
++        let task = tokio::spawn(async move { score_sentence_batches(provider, sentences(512), "Synthetic paper", &task_token, |_,_| panic!("cancelled batch must not complete")).await });
++        tokio::time::timeout(Duration::from_secs(3), async {
++            while api.calls.load(Ordering::SeqCst)==0 { tokio::time::sleep(Duration::from_millis(10)).await; }
++        }).await.unwrap();
++        token.cancel();
++        assert!(tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap().is_err());
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while api.active.load(Ordering::SeqCst)!=0 { tokio::time::sleep(Duration::from_millis(10)).await; }
++        }).await.unwrap();
++        assert_eq!(api.calls.load(Ordering::SeqCst),1);
++    }
++
++    #[tokio::test]
++    async fn pre_cancelled_job_sends_nothing() {
++        let api = MockApi::start(Duration::ZERO, "ok").await;
++        let token = CancellationToken::new(); token.cancel();
++        assert!(score_sentence_batches(api.provider(),sentences(32),"Synthetic paper",&token,|_,_| panic!("cancelled job")).await.is_err());
++        assert_eq!(api.calls.load(Ordering::SeqCst),0);
++    }
++
++    #[tokio::test]
++    async fn invalid_or_error_response_does_not_report_completion() {
++        for mode in ["missing","error"] {
++            let api = MockApi::start(Duration::ZERO,mode).await;
++            assert!(score_sentence_batches(api.provider(),sentences(64),"Synthetic paper",&CancellationToken::new(),|_,_| panic!("failed batch must not complete")).await.is_err());
++            assert_eq!(api.calls.load(Ordering::SeqCst),1);
++        }
++    }
++}
+--- a/crates/agentero-core/src/decision/providers/system_one.rs
++++ b/crates/agentero-core/src/decision/providers/system_one.rs
+@@ -57,7 +57,7 @@
+         auth: impl Fn() -> Result<SystemOneCredentials, AppError> + Send + Sync + 'static,
+     ) -> Self {
+         let client =
+-            http::client(Duration::from_secs(120)).unwrap_or_else(|_| reqwest::Client::new());
++            http::client(Duration::from_secs(300)).unwrap_or_else(|_| reqwest::Client::builder().timeout(Duration::from_secs(300)).build().expect("Could not initialize decision HTTP client"));
+         Self::new(client, auth)
+     }
+ 
+@@ -400,3 +400,106 @@
+     }
+ }
+ 
++
++
++#[cfg(test)]
++mod kaggle_transport_tests {
++    use super::*;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    async fn api(chunked: bool) -> (String, std::sync::Arc<tokio::sync::Notify>, tokio::sync::mpsc::UnboundedSender<bool>, tokio::task::JoinHandle<()>) {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let url = format!("http://{}/v1/systemone",listener.local_addr().unwrap());
++        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
++        let signal = ready.clone();
++        let (tx,mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
++        let task = tokio::spawn(async move {
++            let (mut socket,_) = listener.accept().await.unwrap();
++            let mut raw=Vec::new();
++            loop {
++                let mut buf=[0;4096]; let n=socket.read(&mut buf).await.unwrap();
++                if n==0 {return;}
++                raw.extend_from_slice(&buf[..n]);
++                if let Some(end)=raw.windows(4).position(|x| x==b"\r\n\r\n") {
++                    let headers=String::from_utf8_lossy(&raw[..end]).to_lowercase();
++                    let size:usize=headers.lines().find_map(|l|l.strip_prefix("content-length:")).unwrap().trim().parse().unwrap();
++                    if raw.len()>=end+4+size {break;}
++                }
++            }
++            if chunked {
++                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
++            }
++            signal.notify_one();
++            while let Some(finish)=rx.recv().await {
++                if finish {
++                    let body=r#"{"answers":{"q":{"score":2.0}}}"#;
++                    let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
++                    let _=socket.write_all(response.as_bytes()).await;break;
++                }
++                if socket.write_all(b"1\r\n \r\n").await.is_err() {break;}
++            }
++        });
++        (url,ready,tx,task)
++    }
++
++    async fn settle() {
++        for _ in 0..100 {tokio::task::yield_now().await;}
++    }
++
++    async fn real_deadline() {
++        let start=std::time::Instant::now();
++        while start.elapsed()<Duration::from_secs(10) {tokio::task::yield_now().await;}
++    }
++
++    async fn wait_ready(ready: &tokio::sync::Notify) {
++        tokio::select! {
++            _=ready.notified()=>{},
++            _=real_deadline()=>panic!("mock HTTP server did not receive the request"),
++        }
++    }
++
++    async fn finish<T>(mut task: tokio::task::JoinHandle<T>) -> T {
++        tokio::select! {
++            result=&mut task=>result.unwrap(),
++            _=real_deadline()=>{task.abort();panic!("mock HTTP response did not complete");},
++        }
++    }
++
++    fn provider(url: String) -> SystemOneProvider {
++        SystemOneProvider::with_shared_client(move || Ok(SystemOneCredentials {
++            api_key:"synthetic-test-only".into(),base_url:url.clone(),model:"elephant-1".into()
++        }))
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn response_can_outlive_the_original_120_second_deadline() {
++        // Keep the runtime runnable so virtual time advances only when requested.
++        let driver=tokio::spawn(async {loop {tokio::task::yield_now().await;}});
++        let (url,ready,tx,server)=api(false).await;
++        let request=tokio::spawn(async move {provider(url).complete(json!({"state":"test","questions":{}})).await});
++        wait_ready(&ready).await;
++        tokio::time::advance(Duration::from_secs(150)).await;settle().await;
++        assert!(!request.is_finished(),"the old 120 second timeout must not fire");
++        tx.send(true).unwrap();
++        assert!(finish(request).await.is_ok());
++        server.await.unwrap();driver.abort();
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn whitespace_does_not_extend_the_300_second_total_deadline() {
++        let driver=tokio::spawn(async {loop {tokio::task::yield_now().await;}});
++        let (url,ready,tx,server)=api(true).await;
++        let request=tokio::spawn(async move {provider(url).complete(json!({"state":"test","questions":{}})).await});
++        wait_ready(&ready).await;settle().await;
++        for _ in 0..4 {
++            tx.send(false).unwrap();settle().await;
++            tokio::time::advance(Duration::from_secs(60)).await;settle().await;
++            assert!(!request.is_finished());
++        }
++        tx.send(false).unwrap();settle().await;
++        tokio::time::advance(Duration::from_secs(61)).await;settle().await;
++        assert!(request.is_finished(),"the request must have a bounded total lifetime");
++        assert!(finish(request).await.is_err());
++        server.abort();driver.abort();
++    }
++}
+--- a/src-tauri/src/features/system/updater.rs
++++ b/src-tauri/src/features/system/updater.rs
+@@ -1,9 +1,6 @@
+ use serde::Serialize;
+-use std::time::Duration;
+-use tauri::{Manager, ResourceId, Runtime, Webview};
+-use tauri_plugin_updater::{Error, UpdaterExt};
++use tauri::{ResourceId, Runtime, Webview};
+ 
+-const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+ 
+ #[derive(Serialize, specta::Type)]
+ #[serde(rename_all = "camelCase")]
+@@ -21,31 +18,7 @@
+     proxy: Option<String>,
+     retry_on_timeout: bool,
+ ) -> Result<Option<AppUpdate>, String> {
+-    let mut builder = webview.updater_builder().timeout(CHECK_TIMEOUT);
+-    if let Some(proxy) = proxy {
+-        builder = builder.proxy(tauri::Url::parse(&proxy).map_err(|error| error.to_string())?);
+-    }
+-    let updater = builder.build().map_err(|error| error.to_string())?;
+-
+-    // The plugin's IPC error string loses reqwest's timeout cause.
+-    let mut result = updater.check().await;
+-    if retry_on_timeout && matches!(&result, Err(Error::Reqwest(error)) if error.is_timeout()) {
+-        log::info!("updater_check timed out; retrying once");
+-        result = updater.check().await;
+-    }
+-
+-    Ok(result.map_err(|error| error.to_string())?.map(|update| {
+-        let current_version = update.current_version.clone();
+-        let version = update.version.clone();
+-        let body = update.body.clone();
+-        // Register the same native resource consumed by the updater plugin's download and install.
+-        let rid = webview.resources_table().add(update);
+-        AppUpdate {
+-            rid,
+-            current_version,
+-            version,
+-            body,
+-        }
+-    }))
++    // This portable build is updated from its reproducible adapter repository.
++    let _ = (webview, proxy, retry_on_timeout);
++    Ok(None)
+ }
+-
+--- a/crates/agentero-core/Cargo.toml
++++ b/crates/agentero-core/Cargo.toml
+@@ -57,7 +57,7 @@
+ fs2 = "0.4"
+ 
+ [dev-dependencies]
+-tokio = { workspace = true, features = ["macros", "rt", "fs"] }
++tokio = { workspace = true, features = ["macros", "rt", "fs", "test-util", "net"] }
+ # Unique temp-dir names in `fs::path` tests.
+ uuid = { version = "1", features = ["v4"] }
+ 

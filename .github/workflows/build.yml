@@ -1,0 +1,97 @@
+name: Build Windows portable adapter
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: adapter-windows
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      UPSTREAM_SHA: fdacc2bc9da8a4e5569cf986acf2ef09e62d396b
+      NODE_OPTIONS: --max-old-space-size=6144
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_RELEASE_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch and patch pinned upstream
+        shell: pwsh
+        run: |
+          git init upstream
+          git -C upstream remote add origin https://github.com/poco-ai/Agentero.git
+          git -C upstream fetch --depth 1 origin $env:UPSTREAM_SHA
+          git -C upstream config core.autocrlf false
+          git -C upstream checkout --detach FETCH_HEAD
+          if ((git -C upstream rev-parse HEAD) -ne $env:UPSTREAM_SHA) { throw 'Source revision mismatch' }
+          git -C upstream submodule update --init --recursive
+          git -C upstream apply --check ../patches/agentero.patch
+          if ($LASTEXITCODE) { throw 'Patch validation failed' }
+          git -C upstream apply ../patches/agentero.patch
+          if ($LASTEXITCODE) { throw 'Patch failed' }
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11.5.3'
+          run_install: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+          components: rustfmt
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Prepare frontend and native resources
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE) { throw 'Frontend dependencies failed' }
+          pnpm pdfium:stage
+          if ($LASTEXITCODE) { throw 'PDFium staging failed' }
+          pnpm adapters:stage
+          if ($LASTEXITCODE) { throw 'Adapter staging failed' }
+          pnpm plugin-worker:stage:release
+          if ($LASTEXITCODE) { throw 'Plugin host staging failed' }
+          pnpm build
+          if ($LASTEXITCODE) { throw 'Frontend build failed' }
+      - name: Format adapted Rust source
+        working-directory: upstream
+        run: rustfmt --edition 2021 src-tauri/src/features/jev/service.rs crates/agentero-core/src/decision/providers/system_one.rs src-tauri/src/features/system/updater.rs
+      - name: Test total request deadline
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          cargo test --locked -p agentero-core kaggle_transport_tests -- --nocapture --test-threads=1
+          if ($LASTEXITCODE) { throw 'Transport tests failed' }
+      - name: Test serial batches, cancellation and errors
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          cargo test --locked -p agentero kaggle_tests --lib -- --nocapture --test-threads=1
+          if ($LASTEXITCODE) { throw 'Highlight tests failed' }
+      - name: Build portable desktop application
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          pnpm tauri build --no-bundle
+          if ($LASTEXITCODE) { throw 'Application build failed' }
+      - name: Package executable, resources and provenance
+        run: python scripts/package_portable.py upstream
+      - name: Save verified portable package in draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release view adapter-v1 --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE) {
+            gh release create adapter-v1 --draft --title 'Agentero Kaggle Adapter v1' --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE) { throw 'Draft release creation failed' }
+          }
+          gh release upload adapter-v1 output/Agentero-Kaggle-v1-windows-x64.zip output/SHA256SUMS.txt output/BUILD-MANIFEST.json --clobber --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE) { throw 'Draft artifact upload failed' }
