@@ -54,7 +54,12 @@ def main():
         if path.is_file():
             (folder / name).write_bytes(path.read_bytes())
     if args.prepare_only:
-        print(json.dumps({"executable": str(executable), "backup": str(folder)}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"executable": str(executable), "backup": str(folder)},
+                ensure_ascii=False,
+            )
+        )
         return
     subprocess.Popen(
         [str(executable)],

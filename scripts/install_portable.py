@@ -4,38 +4,90 @@ import argparse
 import hashlib
 import json
 import subprocess
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workspace", type=Path, required=True)
-    args = parser.parse_args()
-    workspace = args.workspace.resolve()
-    downloads = workspace / "AgenteroKaggleAdapter/.work/download"
-    downloads.mkdir(parents=True, exist_ok=True)
+def download_assets(downloads, gh_executable="gh"):
+    metadata = json.loads(
+        subprocess.check_output(
+            [
+                gh_executable,
+                "release",
+                "view",
+                "adapter-v1",
+                "--repo",
+                "yatools/agentero-kaggle-adapter",
+                "--json",
+                "assets",
+            ],
+            text=True,
+            timeout=40,
+        )
+    )
+    assets = {item["name"]: item for item in metadata["assets"]}
     for name in (
         "Agentero-Kaggle-v1-windows-x64.zip",
         "SHA256SUMS.txt",
         "BUILD-MANIFEST.json",
     ):
-        subprocess.run(
-            [
-                "gh",
-                "release",
-                "download",
-                "adapter-v1",
-                "--repo",
-                "yatools/agentero-kaggle-adapter",
-                "--pattern",
-                name,
-                "--dir",
-                str(downloads),
-                "--clobber",
-            ],
-            check=True,
-        )
+        asset = assets[name]
+        url = asset["apiUrl"]
+        if not url.startswith(
+            "https://api.github.com/repos/yatools/agentero-kaggle-adapter/releases/assets/"
+        ):
+            raise RuntimeError("Unexpected release asset source")
+        size = int(asset["size"])
+        chunks = [
+            (start, min(start + 512 * 1024, size) - 1)
+            for start in range(0, size, 512 * 1024)
+        ]
+
+        def fetch(bounds):
+            start, end = bounds
+            for attempt in range(3):
+                try:
+                    data = subprocess.check_output(
+                        [
+                            gh_executable,
+                            "api",
+                            url + "?nocache=" + str(time.time_ns()),
+                            "--header",
+                            "Accept: application/octet-stream",
+                            "--header",
+                            f"Range: bytes={start}-{end}",
+                        ],
+                        timeout=45,
+                        stderr=subprocess.PIPE,
+                    )
+                    if len(data) != end - start + 1:
+                        raise RuntimeError("Release asset returned an incomplete range")
+                    return data
+                except (subprocess.SubprocessError, RuntimeError):
+                    if attempt == 2:
+                        raise
+            raise RuntimeError("Release download failed")
+
+        with (
+            (downloads / name).open("wb") as output,
+            ThreadPoolExecutor(max_workers=8) as pool,
+        ):
+            for data in pool.map(fetch, chunks):
+                output.write(data)
+                output.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--workspace", type=Path, required=True)
+    parser.add_argument("--gh-executable", default="gh")
+    args = parser.parse_args()
+    workspace = args.workspace.resolve()
+    downloads = workspace / "AgenteroKaggleAdapter/.work/download"
+    downloads.mkdir(parents=True, exist_ok=True)
+    download_assets(downloads, args.gh_executable)
     archive = downloads / "Agentero-Kaggle-v1-windows-x64.zip"
     expected = (downloads / "SHA256SUMS.txt").read_text(encoding="utf-8").split()[0]
     actual = hashlib.sha256(archive.read_bytes()).hexdigest()
