@@ -85,10 +85,10 @@
  
      // Phase 2: build highlights from the pre-computed sentence geometry.
      // No second PDF locate pass is needed because extract_text_in_pdf already
-@@ -342,3 +352,150 @@
+@@ -341,3 +351,150 @@
+ ) -> Result<Vec<SuggestedHighlight>, AppError> {
      jev_suggest_highlights_impl(provider.clone(), pdf_path, title, cancel_token, on_progress).await
  }
- 
 +
 +
 +#[cfg(test)]
@@ -247,10 +247,10 @@
          Self::new(client, auth)
      }
  
-@@ -400,3 +400,106 @@
+@@ -399,3 +399,106 @@
+         assert_eq!(stringy.confidence, None);
      }
  }
- 
 +
 +
 +#[cfg(test)]
@@ -367,7 +367,7 @@
  
  #[derive(Serialize, specta::Type)]
  #[serde(rename_all = "camelCase")]
-@@ -21,31 +18,7 @@
+@@ -21,30 +18,7 @@
      proxy: Option<String>,
      retry_on_timeout: bool,
  ) -> Result<Option<AppUpdate>, String> {
@@ -401,7 +401,6 @@
 +    let _ = (webview, proxy, retry_on_timeout);
 +    Ok(None)
  }
--
 --- a/crates/agentero-core/Cargo.toml
 +++ b/crates/agentero-core/Cargo.toml
 @@ -57,7 +57,7 @@
