@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import time
 import zipfile
@@ -145,9 +146,19 @@ def main():
         ):
             raise RuntimeError("Portable resource verification failed")
     executable = target / "agentero.exe"
+    alias = target / "Agentero-Kaggle.exe"
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    if alias.exists():
+        if hashlib.sha256(alias.read_bytes()).hexdigest() != digest:
+            raise RuntimeError("Existing adapter launcher has unexpected contents")
+    else:
+        try:
+            alias.hardlink_to(executable)
+        except OSError:
+            shutil.copyfile(executable, alias)
     state = {
-        "executable": str(executable),
-        "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "executable": str(alias),
+        "executable_sha256": digest,
         "archive_size_bytes": archive.stat().st_size,
         "archive_sha256": actual,
         "upstream_commit": manifest["upstream_commit"],

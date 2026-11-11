@@ -16,7 +16,7 @@ def running_agentero():
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); Get-CimInstance Win32_Process -Filter \"Name='agentero.exe'\" | Select-Object -ExpandProperty ProcessId",
+            "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); Get-CimInstance Win32_Process -Filter \"Name='agentero.exe' OR Name='Agentero-Kaggle.exe'\" | Select-Object -ExpandProperty ProcessId",
         ],
         capture_output=True,
         encoding="utf-8",
@@ -37,7 +37,7 @@ def main():
     args = parser.parse_args()
     if running_agentero():
         raise RuntimeError(
-            "请先保存工作并完全退出原版 Agentero，再启动 Kaggle 适配版；没有强制关闭任何程序。"
+            "请先保存工作并完全退出正在运行的 Agentero，再启动 Kaggle 适配版；没有强制关闭任何程序。"
         )
     state = json.loads(args.install_state.read_text(encoding="utf-8"))
     executable = Path(state["executable"]).resolve()

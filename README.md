@@ -59,3 +59,7 @@ duplicate retry. Decision audit records contain counts and timings only.
 every resource before extracting into a versioned application directory.
 `scripts/launch_portable.py` backs up local settings privately and refuses to start
 while another Agentero instance is running. These scripts never upload settings.
+
+The installer exposes the verified executable as `Agentero-Kaggle.exe` so desktop
+launchers can distinguish it from an installed official copy. Both executable
+names contain identical bytes. The launcher detects either process name.
