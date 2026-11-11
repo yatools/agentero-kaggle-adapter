@@ -1,0 +1,1010 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,12 @@
+ .kis/
+ .venv/
+ __pycache__/
++.uv-cache/
++secrets.json
++kaggle.json
++access_token
++access_token.*
++.env
++.env.*
++.test-tmp/
++.pytest_cache/
+--- a/kis/schema.py
++++ b/kis/schema.py
+@@ -151,7 +151,7 @@
+ 
+ @dataclass(frozen=True)
+ class Model:
+-    """A model preset: GGUF files on Hugging Face and how to serve them."""
++    """A model preset: GGUF files on Hugging Face or a mounted Kaggle dataset."""
+ 
+     repo: str
+     file: str
+@@ -165,6 +165,8 @@
+     topology: Topology | None = None  # default: by file size and replica_max_gb
+     tensor_split: str | None = None  # split topology: layers per GPU, e.g. "5,4"
+     args: list[str] = field(default_factory=list)
++    dataset: str | None = None  # owner/slug; read mounted files without downloading weights
++    gguf_compat: Literal["elephant-1"] | None = None
+ 
+ 
+ @dataclass
+@@ -275,6 +277,7 @@
+     STATS = "/admin/stats"  # GET: Stats as JSON
+     LOGS = "/admin/logs"  # GET ?file=server.log&lines=200
+     SHUTDOWN = "/admin/shutdown"  # POST ?session=<id>: 409 if that is another session
++    CANCEL = "/admin/cancel"  # POST ?session=<id>&request_id=<uuid>: cancel one forwarding attempt
+     LOAD = "/admin/load"  # POST ?model=<preset or alias>: 202 while it loads, 200 if loaded
+     MODELS = "/v1/models"  # every preset of the session, with its status (also at /models)
+ 
+--- a/kis/client.py
++++ b/kis/client.py
+@@ -60,6 +60,10 @@
+         """Ask `session` to stop: OK, or CONFLICT if the URL reached another session."""
+         return HTTPStatus(self._call(Route.SHUTDOWN, "POST", session=session)[0])
+ 
++    def cancel(self, session: str, request_id: str) -> HTTPStatus:
++        """Cancel one attempt in its original session, never a later replacement."""
++        return HTTPStatus(self._call(Route.CANCEL, "POST", session=session, request_id=request_id)[0])
++
+     def logs(self, file: str, lines: int) -> str:
+         """The last lines of a server-side log; raises RuntimeError with the server's answer."""
+         code, body = self._call(Route.LOGS, file=file, lines=lines)
+--- a/kis/proxy.py
++++ b/kis/proxy.py
+@@ -11,6 +11,7 @@
+ import os
+ import signal
+ import time
++import uuid
+ from collections.abc import AsyncIterator, Callable
+ from dataclasses import dataclass
+ 
+@@ -39,6 +40,8 @@
+ ROLLOVER_MAX_IDLE_S = 300  # an older session idle for longer isn't replaced
+ ATTEMPTS = 10  # about a minute of backoff: a failed request can cost a client far more
+ CLIENT = web.AppKey("client", aiohttp.ClientSession)
++CANCEL_TASKS = web.AppKey("cancel_tasks", set)
++REQUEST_ID_HEADER = "X-KIS-Request-ID"
+ 
+ 
+ class Retryable(Exception):
+@@ -49,6 +52,10 @@
+     def __init__(self, message: str, resp: web.StreamResponse | None = None) -> None:
+         super().__init__(message)
+         self.resp = resp
++
++
++class CancelUnconfirmed(Exception):
++    """Do not retry a decision while the previous attempt might still be running."""
+ 
+ 
+ KEEPALIVE = b": keepalive\n\n"  # what the balancer sends while a request waits: an SSE comment, or a space
+@@ -80,7 +87,13 @@
+ 
+ 
+ def run(config: Config, secrets: Secrets, host: str, port: int) -> None:
+-    web.run_app(make_app(config, secrets), host=host, port=port, print=lambda msg: log.info(msg.strip()))
++    web.run_app(
++        make_app(config, secrets),
++        host=host,
++        port=port,
++        handler_cancellation=True,
++        print=lambda msg: log.info(msg.strip()),
++    )
+ 
+ 
+ def authorized(req: web.Request, key: str) -> bool:
+@@ -153,13 +166,38 @@
+                 log.error("rollover failed: %s; next try in 10 min", e)
+                 await asyncio.sleep(600)
+ 
++    async def cancel_attempt(app: web.Application, url: str, session: str, request_id: str) -> bool:
++        # A separate authenticated request also works when Cloudflare buffers the
++        # disconnected inference stream. Never substitute a newer session here.
++        for _ in range(3):
++            try:
++                async with app[CLIENT].post(
++                    url + "/admin/cancel",
++                    params={"session": session, "request_id": request_id},
++                    headers={"Authorization": f"Bearer {secrets.api_key}"},
++                    timeout=aiohttp.ClientTimeout(total=5),
++                ) as response:
++                    if response.status == 200:
++                        answer = await response.json()
++                        return answer.get("status") in ("cancelled", "not_running")
++                    if response.status != 202:
++                        return False
++            except (aiohttp.ClientError, TimeoutError, ValueError):
++                pass
++            await asyncio.sleep(0.1)
++        return False
++
+     async def handle(req: web.Request) -> web.StreamResponse:
+         if local_key and not authorized(req, local_key):
+             log.warning("%s %s 401 (wrong or missing KIS_PROXY_API_KEY)", req.method, req.path)
+             return web.json_response(api_error("invalid api key"), status=401)
+         if not upstream.url:
+             return web.json_response(api_error("no Kaggle server running (kis up <model>)"), status=503)
+-        headers = {k: v for k, v in req.headers.items() if k.lower() not in HOP_HEADERS}
++        headers = {
++            k: v
++            for k, v in req.headers.items()
++            if k.lower() not in HOP_HEADERS and k.lower() != REQUEST_ID_HEADER.lower()
++        }
+         headers["Authorization"] = f"Bearer {secrets.api_key}"
+         start, status = time.time(), 0
+         started: web.StreamResponse | None = None  # the client response, once the balancer's padding began it
+@@ -167,7 +205,25 @@
+             for attempt in range(ATTEMPTS):
+                 last = attempt == ATTEMPTS - 1
+                 try:
+-                    resp = await forward(req, f"{upstream.url}{req.rel_url}", headers, not last, started)
++                    request_id = session_id = ""
++                    base_url = upstream.url
++                    if req.method == "POST" and req.path == "/v1/systemone":
++                        current = await asyncio.to_thread(events.current, config, topic)
++                        if not current or not current.endpoint:
++                            raise Retryable("current cloud session is not yet known", started)
++                        base_url, session_id = current.endpoint, current.session
++                        request_id = uuid.uuid4().hex
++                        headers[REQUEST_ID_HEADER] = request_id
++                    req["kis_forward_complete"] = False
++                    try:
++                        resp = await forward(req, f"{base_url}{req.rel_url}", headers, not last, started)
++                    finally:
++                        if request_id and not req["kis_forward_complete"]:
++                            cleanup = asyncio.create_task(cancel_attempt(req.app, base_url, session_id, request_id))
++                            req.app[CANCEL_TASKS].add(cleanup)
++                            cleanup.add_done_callback(req.app[CANCEL_TASKS].discard)
++                            if not await asyncio.shield(cleanup):
++                                raise CancelUnconfirmed("previous decision cancellation could not be confirmed")
+                     status = resp.status
+                     upstream.reached(status != TUNNEL_DOWN)
+                     return resp
+@@ -197,6 +253,14 @@
+                     # the tunnel may have restarted with a new URL
+                     upstream.url = await asyncio.to_thread(events.endpoint, config, topic) or upstream.url
+             raise AssertionError("unreachable")
++        except CancelUnconfirmed as error:
++            log.warning("decision cancellation unconfirmed; no retry was started")
++            body = api_error(str(error))
++            if started is not None:
++                await started.write(json.dumps(body).encode())
++                await started.write_eof()
++                return started
++            return web.json_response(body, status=502)
+         finally:
+             log.info("%s %s %s %.2fs", req.method, req.path, status or "-", time.time() - start)
+ 
+@@ -226,6 +290,7 @@
+                     answering = answering or not padding_only(chunk)
+                     await resp.write(chunk)
+                 await resp.write_eof()
++                req["kis_forward_complete"] = True
+             except ConnectionResetError:  # client went away mid-stream; closing upstream stops generation
+                 pass
+             except (aiohttp.ClientError, TimeoutError) as e:
+@@ -239,6 +304,7 @@
+ 
+     async def lifecycle(app: web.Application) -> AsyncIterator[None]:
+         app[CLIENT] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=20))
++        app[CANCEL_TASKS] = set()
+         tasks = [asyncio.create_task(follow_endpoint())]
+         if give_up_s:
+             log.info("stopping after %.0f min without a reachable server", give_up_s / 60)
+@@ -249,6 +315,9 @@
+         yield
+         for task in tasks:
+             task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        if app[CANCEL_TASKS]:
++            await asyncio.gather(*list(app[CANCEL_TASKS]), return_exceptions=True)
+         await app[CLIENT].close()
+ 
+     app = web.Application(client_max_size=256 << 20)
+--- a/kis/kaggle.py
++++ b/kis/kaggle.py
+@@ -38,6 +38,7 @@
+ 
+ # Modules a Kaggle script imports, pasted into it when it is pushed (Kaggle runs a single file).
+ INLINED = {
++    "gguf_compat": ROOT / "kaggle" / "gguf_compat.py",
+     "common": ROOT / "kaggle" / "common.py",
+     "kis.schema": ROOT / "kis" / "schema.py",
+     "backends": ROOT / "kaggle" / "backends.py",
+@@ -103,7 +104,9 @@
+         "enable_gpu": True,
+         "enable_tpu": False,
+         "enable_internet": True,
+-        "dataset_sources": [],
++        "dataset_sources": sorted({m.dataset for m in config.models.values() if m.dataset})
++        if script in (SERVER_SCRIPT, CALIBRATE_SCRIPT)
++        else [],
+         "competition_sources": [],
+         "model_sources": [],
+         "kernel_sources": sources or [],
+--- a/kaggle/common.py
++++ b/kaggle/common.py
+@@ -11,6 +11,7 @@
+ import json
+ import logging
+ import os
++import re
+ import shutil
+ import subprocess
+ import threading
+@@ -19,9 +20,11 @@
+ from pathlib import Path
+ 
+ from kis.schema import CpuStats, Event, GpuStats, Model, Ntfy, RamStats
++from gguf_compat import elephant_compatible
+ 
+ CGROUP, PROC = Path("/sys/fs/cgroup"), Path("/proc")  # the container's memory accounting, and the processes
+ MODELS_DIR = Path("/kaggle/tmp/models" if os.path.isdir("/kaggle/tmp") else "/tmp/models")
++INPUT_DIR = Path("/kaggle/input")
+ NTFY_MESSAGE_BYTES = 4096  # ntfy.sh's limit; a longer message becomes an attachment, which kis can't read
+ 
+ 
+@@ -52,12 +55,35 @@
+     return "/tmp/llama-server"
+ 
+ 
++def dataset_file(dataset: str, file: str) -> str:
++    """Locate a dataset file in Kaggle's legacy or owner-qualified input layout."""
++    if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", dataset):
++        raise ValueError("dataset must be owner/slug")
++    relative = Path(file)
++    if relative.is_absolute() or ".." in relative.parts or "\\" in file:
++        raise ValueError("dataset file must be a relative path inside the mounted dataset")
++    owner, slug = dataset.split("/")
++    root = INPUT_DIR.resolve()
++    for candidate in (INPUT_DIR / slug / relative, INPUT_DIR / "datasets" / owner / slug / relative):
++        path = candidate.resolve()
++        if not path.is_relative_to(root):
++            raise ValueError("dataset file resolves outside the input directory")
++        if path.is_file():
++            return str(path)
++    raise FileNotFoundError(f"{file} is not mounted for dataset {dataset}; attach the private dataset first")
++
++
+ def fetch(model: Model, file: str, sha256: str | None = None) -> str:
+-    """Download one file of a model preset from Hugging Face; check its sha256 if given."""
+-    from huggingface_hub import hf_hub_download  # pyright: ignore[reportMissingImports]  (on Kaggle)
+-
+-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+-    path: str = hf_hub_download(model.repo, file, revision=model.revision, local_dir=MODELS_DIR)
++    """Read a mounted dataset or download from Hugging Face, then verify its sha256."""
++    if model.gguf_compat and (not model.dataset or not sha256):
++        raise ValueError("GGUF compatibility requires a mounted dataset and source SHA-256")
++    if model.dataset is not None:
++        path = dataset_file(model.dataset, file)
++    else:
++        from huggingface_hub import hf_hub_download  # pyright: ignore[reportMissingImports]  (on Kaggle)
++
++        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
++        path = hf_hub_download(model.repo, file, revision=model.revision, local_dir=MODELS_DIR)
+     if sha256:
+         digest = hashlib.sha256()
+         with open(path, "rb") as f:
+@@ -65,6 +91,13 @@
+                 digest.update(chunk)
+         if digest.hexdigest() != sha256:
+             raise RuntimeError(f"sha256 mismatch for {file}")
++    if model.gguf_compat == "elephant-1" and file == model.file:
++        report = elephant_compatible(Path(path), MODELS_DIR / "compatible", sha256)
++        working = Path("/kaggle/working")
++        if working.is_dir():
++            (working / "elephant-compatibility.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
++        logging.getLogger("kis").info("Elephant metadata compatibility prepared; tensor bytes unchanged")
++        path = report["runtime_file"]
+     return path
+ 
+ 
+--- a/kaggle/backends.py
++++ b/kaggle/backends.py
+@@ -27,6 +27,10 @@
+ 
+ 
+ def _file_key(model: Model, file: str) -> str:
++    if model.gguf_compat:
++        return f"compat:{model.gguf_compat}:{model.dataset}/{model.repo}@{model.revision}/{file}"
++    if model.dataset is not None:
++        return f"dataset:{model.dataset}/{file}"
+     return f"{model.repo}@{model.revision}/{file}"
+ 
+ 
+@@ -109,7 +113,11 @@
+     if code >= 0:
+         return f"exited with code {code}"
+     name = signal.Signals(-code).name if -code in signal.valid_signals() else f"signal {-code}"
+-    hint = " (the kernel's OOM killer sends it when the container is out of RAM)" if -code == signal.SIGKILL else ""
++    hint = (
++        " (the kernel's OOM killer sends it when the container is out of RAM)"
++        if -code == getattr(signal, "SIGKILL", 9)
++        else ""
++    )
+     return f"killed by {name}{hint}"
+ 
+ 
+--- a/kaggle/balancer.py
++++ b/kaggle/balancer.py
+@@ -37,6 +37,9 @@
+ 
+ KEEPALIVE_SECONDS = 30  # below Cloudflare's 100 s limit for the first response byte
+ DRAIN_POLL_S = 0.1  # how often a swap checks whether the requests in flight have finished
++REQUEST_ID_HEADER = "X-KIS-Request-ID"
++CANCEL_TTL_S = 600
++MAX_CANCELLED_IDS = 4096
+ 
+ 
+ class BackendSet(Protocol):
+@@ -270,6 +273,8 @@
+         self.usage: dict[str, Usage] = {}
+         self.session: aiohttp.ClientSession | None = None
+         self.runner: web.AppRunner | None = None
++        self.request_tasks: dict[str, asyncio.Task] = {}
++        self.cancelled_ids: dict[str, float] = {}
+ 
+     @property
+     def idle_seconds(self) -> float:
+@@ -293,19 +298,52 @@
+         return app
+ 
+     async def start(self) -> None:
+-        self.runner = web.AppRunner(self.app())
++        self.runner = web.AppRunner(self.app(), handler_cancellation=True, shutdown_timeout=5)
+         await self.runner.setup()
+         await web.TCPSite(self.runner, "127.0.0.1", PORT).start()
+ 
+     async def close(self) -> None:
++        tasks = list(self.request_tasks.values())
++        for task in tasks:
++            task.cancel()
++        if tasks:
++            await asyncio.wait(tasks, timeout=5)
+         if self.runner:
+             await self.runner.cleanup()
++
++    def prune_cancelled(self) -> None:
++        now = time.monotonic()
++        for request_id, expiry in list(self.cancelled_ids.items()):
++            if expiry <= now:
++                self.cancelled_ids.pop(request_id, None)
++        while len(self.cancelled_ids) > MAX_CANCELLED_IDS:
++            self.cancelled_ids.pop(next(iter(self.cancelled_ids)))
++
++    async def cancel_request(self, req: web.Request) -> web.Response:
++        if req.method != "POST":
++            return web.json_response(api_error("POST required"), status=405)
++        if req.query.get("session") != self.settings.session:
++            return web.json_response(api_error("other session"), status=409)
++        request_id = req.query.get("request_id", "")
++        if not re.fullmatch(r"[a-f0-9]{32}", request_id):
++            return web.json_response(api_error("invalid request id"), status=400)
++        # Remember cancellation even if it beats the slow tunnel request here.
++        self.cancelled_ids[request_id] = time.monotonic() + CANCEL_TTL_S
++        self.prune_cancelled()
++        task = self.request_tasks.get(request_id)
++        if task is None or task.done():
++            return web.json_response({"status": "not_running"})
++        task.cancel()
++        done, _ = await asyncio.wait({task}, timeout=3)
++        return web.json_response({"status": "cancelled" if done else "cancelling"}, status=200 if done else 202)
+ 
+     async def handle(self, req: web.Request) -> web.StreamResponse:
+         if req.path == Route.HEALTH:
+             return web.json_response({"status": "ok"})
+         if req.headers.get("Authorization") != f"Bearer {self.api_key}":
+             return web.json_response(api_error("invalid api key"), status=401)
++        if req.path == Route.CANCEL:
++            return await self.cancel_request(req)
+         if req.path == Route.SHUTDOWN:
+             # With a named tunnel, two sessions share one URL during a rollover: only stop the one asked for.
+             if req.query.get("session", self.settings.session) != self.settings.session:
+@@ -328,6 +366,16 @@
+                 status=429,
+                 headers={"Retry-After": "5"},
+             )
++        request_id = req.headers.get(REQUEST_ID_HEADER, "") if req.path == "/v1/systemone" else ""
++        if request_id:
++            if not re.fullmatch(r"[a-f0-9]{32}", request_id):
++                return web.json_response(api_error("invalid request id"), status=400)
++            self.prune_cancelled()
++            if request_id in self.cancelled_ids:
++                return web.json_response(api_error("request cancelled", type="cancelled"), status=409)
++            if request_id in self.request_tasks:
++                return web.json_response(api_error("request id already active"), status=409)
++            self.request_tasks[request_id] = asyncio.current_task()
+         self.waiting += 1  # counted at once, so concurrent requests see each other in full()
+         admitted = False
+         self.requests += 1
+@@ -367,6 +415,28 @@
+                 return web.json_response(error, status=status)
+             resp, sse, captured = await self.forward(req, body, connect)
+             status = resp.status
++            if req.path == "/v1/systemone" and status == 200:
++                with contextlib.suppress(ValueError, TypeError, AttributeError):
++                    questions = json.loads(body).get("questions", {})
++                    answers = json.loads(captured).get("answers", {})
++                    valid = sum(
++                        isinstance(answers.get(key, {}).get("score"), (int, float)) and 0 <= answers[key]["score"] <= 3
++                        for key, question in questions.items()
++                        if question.get("type") == "score"
++                    )
++                    log.info(
++                        "decision_audit %s",
++                        json.dumps(
++                            {
++                                "session": self.settings.session,
++                                "request_id": request_id,
++                                "questions": len(questions),
++                                "answers": len(answers),
++                                "valid_scores": valid,
++                                "seconds": round(time.time() - start, 3),
++                            }
++                        ),
++                    )
+             if status >= 500:
+                 self.errors += 1
+             if req.method == "POST" and (c := parse_usage(bytes(captured), sse)):
+@@ -378,6 +448,8 @@
+             log.exception("%s %s -> :%d failed", req.method, req.path, port)
+             raise
+         finally:
++            if request_id:
++                self.request_tasks.pop(request_id, None)
+             if admitted and name in self.residents:
+                 self.resident_inflight -= 1
+             elif admitted:
+@@ -650,9 +722,10 @@
+             pass
+         finally:
+             if pending.done() and not pending.cancelled() and not pending.exception():
+-                await pending.result().__aexit__(None, None, None)
++                pending.result().close()
+             else:
+                 pending.cancel()
++                await asyncio.gather(pending, return_exceptions=True)
+         if resp is None:
+             raise ConnectionResetError("upstream closed before responding")
+         return resp, sse, captured
+--- /dev/null
++++ b/kaggle/gguf_compat.py
+@@ -0,0 +1,87 @@
++"""Metadata-only compatibility copy for the pinned Elephant-1 decision GGUF."""
++import hashlib
++import json
++import os
++import shutil
++import struct
++from pathlib import Path
++
++ELEPHANT_SHA256 = "5bc2a8f7c707da1680b49a3984a762478733f894eb38c9b4d07babf2f0004b6a"
++HEADER_BYTES = 65536
++
++
++def _patches(header: bytes) -> list[tuple[int, bytes, bytes]]:
++    if header[:4] != b"GGUF" or struct.unpack_from("<I", header, 4)[0] != 3:
++        raise RuntimeError("Elephant compatibility requires the pinned little-endian GGUF v3")
++    patches = []
++    for key, old, new in ((b"qwen35.block_count", 33, 32), (b"qwen35.nextn_predict_layers", 1, 0)):
++        prefix = struct.pack("<Q", len(key)) + key + struct.pack("<I", 4)  # UINT32
++        pattern = prefix + struct.pack("<I", old)
++        offset = header.find(pattern)
++        if offset < 0 or header.find(pattern, offset + 1) >= 0:
++            raise RuntimeError("Pinned Elephant metadata differs from the inspected layout")
++        patches.append((offset + len(prefix), struct.pack("<I", old), struct.pack("<I", new)))
++    key = b"qwen35.attention.recurrent_layers"
++    renamed = b"custom.attention.recurrent_layers"
++    pattern = struct.pack("<Q", len(key)) + key + struct.pack("<IIQ", 9, 7, 33)  # ARRAY of BOOL
++    offset = header.find(pattern)
++    if offset < 0 or header.find(pattern, offset + 1) >= 0:
++        raise RuntimeError("Pinned Elephant recurrent-layer metadata was not found uniquely")
++    values = header[offset + len(pattern):offset + len(pattern) + 33]
++    expected = bytes([int((index + 1) % 4 != 0) for index in range(32)] + [0])
++    if values != expected or len(key) != len(renamed):
++        raise RuntimeError("Elephant layer mask does not match the 32-layer trunk")
++    # The loader reconstructs the same 32-entry mask from full_attention_interval=4.
++    # Renaming the obsolete 33-entry key keeps every byte offset unchanged.
++    patches.append((offset + 8, key, renamed))
++    return patches
++
++
++def _verify(path: Path, patches: list[tuple[int, bytes, bytes]]) -> str:
++    original_digest, runtime_digest = hashlib.sha256(), hashlib.sha256()
++    with path.open("rb") as handle:
++        header = handle.read(HEADER_BYTES)
++        runtime_digest.update(header)
++        restored = bytearray(header)
++        for offset, old, new in patches:
++            if restored[offset:offset + len(new)] != new:
++                raise RuntimeError("Incomplete Elephant compatibility copy")
++            restored[offset:offset + len(old)] = old
++        original_digest.update(restored)
++        for chunk in iter(lambda: handle.read(16 << 20), b""):
++            original_digest.update(chunk)
++            runtime_digest.update(chunk)
++    if original_digest.hexdigest() != ELEPHANT_SHA256:
++        raise RuntimeError("Compatibility copy differs outside the intended metadata bytes")
++    return runtime_digest.hexdigest()
++
++
++def elephant_compatible(original: Path, cache: Path, source_sha256: str) -> dict:
++    if source_sha256 != ELEPHANT_SHA256:
++        raise RuntimeError("Elephant compatibility is restricted to the inspected source SHA-256")
++    with original.open("rb") as handle:
++        patches = _patches(handle.read(HEADER_BYTES))
++    cache.mkdir(parents=True, exist_ok=True)
++    target = cache / ("elephant-runtime-" + source_sha256[:16] + ".gguf")
++    if target.exists():
++        runtime_sha256 = _verify(target, patches)
++    else:
++        partial = target.with_suffix(".partial")
++        try:
++            shutil.copyfile(original, partial)
++            with partial.open("r+b") as handle:
++                for offset, old, new in patches:
++                    handle.seek(offset)
++                    if handle.read(len(old)) != old:
++                        raise RuntimeError("Source metadata changed while creating compatibility copy")
++                    handle.seek(offset)
++                    handle.write(new)
++            runtime_sha256 = _verify(partial, patches)
++            os.replace(partial, target)
++        finally:
++            partial.unlink(missing_ok=True)
++    return {"source_sha256": source_sha256, "runtime_sha256": runtime_sha256,
++            "source_file": str(original), "runtime_file": str(target),
++            "original_bytes_verified": True, "tensor_bytes_unchanged": True,
++            "metadata_changes": {"block_count": 32, "nextn_predict_layers": 0,
++                                 "legacy_recurrent_mask": "ignored; same 32-layer mask reconstructed"}}
+--- /dev/null
++++ b/examples/config.elephant.dataset.toml
+@@ -0,0 +1,45 @@
++# Text decision model backed by a private Kaggle dataset.
++# Replace both occurrences of your-kaggle-username before using this example.
++# GPU settings are validated with deployment/verify_service.py.
++[kaggle]
++username = "your-kaggle-username"
++accelerator = "NvidiaTeslaT4"
++llama_cpp_ref = "v0.6.0"
++
++[tunnel]
++kind = "cloudflared"
++
++[server]
++idle_minutes = 10
++max_hours = 11.5
++rollover_hours = 0
++ctx = 16384
++autoload = false
++prefetch = []
++resident = []
++args = [
++  "--n-gpu-layers", "999",
++  "--flash-attn", "on",
++  "--cache-type-k", "f16",
++  "--cache-type-v", "f16",
++  "--jinja",
++  "--cache-ram", "0",
++  "--ctx-checkpoints", "0",
++  "--metrics",
++  # Non-causal decision prompts must fit in one physical batch.
++  "--batch-size", "16384",
++  "--ubatch-size", "16384",
++]
++
++[models.elephant-1]
++repo = "waseigo/elephant-1-decision-GGUF"
++revision = "6494b79c57cdac75edccf3661889975618175b3b"
++dataset = "your-kaggle-username/elephant-1-decision-gguf"
++file = "elephant-1-Q4_K_M.gguf"
++sha256 = "5bc2a8f7c707da1680b49a3984a762478733f894eb38c9b4d07babf2f0004b6a"
++alias = "elephant-1"
++topology = "split"
++parallel = 16
++ctx = 16384
++# Prepare a cloud-only metadata compatibility copy; preserve all tensor bytes.
++gguf_compat = "elephant-1"
+--- a/tests/test_common.py
++++ b/tests/test_common.py
+@@ -28,7 +28,10 @@
+ 
+ 
+ def test_gpu_stats_survive_a_missing_nvidia_smi(monkeypatch):
+-    monkeypatch.setenv("PATH", "")
++    def missing(*args, **kwargs):
++        raise FileNotFoundError("nvidia-smi")
++
++    monkeypatch.setattr(common.subprocess, "check_output", missing)
+     assert common.gpu_stats() == []
+ 
+ 
+@@ -139,7 +142,7 @@
+     monkeypatch.setattr(common, "PROC", proc)
+     monkeypatch.setattr(common, "CGROUP", cgroup)
+     monkeypatch.setattr(common.time, "monotonic", lambda: clock["t"])
+-    monkeypatch.setattr(common.os, "sysconf", lambda name: 100)  # clock ticks per second
++    monkeypatch.setattr(common.os, "sysconf", lambda name: 100, raising=False)  # Linux clock ticks; also mockable on Windows
+ 
+     def set_cpu(container_s: float, process_ticks: int):
+         (cgroup / "cpu.stat").write_text(f"usage_usec {int(container_s * 1e6)}\nuser_usec 1\n")
+--- /dev/null
++++ b/tests/test_dataset_storage.py
+@@ -0,0 +1,101 @@
++"""Dataset integration checks using tiny synthetic files; never run Kaggle jobs."""
++
++import dataclasses
++import hashlib
++import json
++import subprocess
++import sys
++import tempfile
++import types
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "kaggle"))
++import common
++import backends
++from kis import kaggle
++from kis.schema import Model
++from kis.settings import parse_config
++
++
++class DatasetStorageTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.root = Path(self.temp.name)
++        self.addCleanup(self.temp.cleanup)
++        self.model = Model(repo="provenance/model", file="model.gguf", alias="test", parallel=1, dataset="owner/model")
++
++    def create_file(self, layout):
++        path = self.root / layout / self.model.file
++        path.parent.mkdir(parents=True)
++        path.write_bytes(b"synthetic-test-data")
++        return path
++
++    def test_reads_both_mount_layouts_and_checks_hash_without_hf(self):
++        for layout in ("model", "datasets/owner/model"):
++            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as folder:
++                root = Path(folder)
++                path = root / layout / self.model.file
++                path.parent.mkdir(parents=True)
++                path.write_bytes(b"synthetic-test-data")
++                digest = hashlib.sha256(path.read_bytes()).hexdigest()
++                with patch.object(common, "INPUT_DIR", root), patch.dict(sys.modules, {"huggingface_hub": None}):
++                    self.assertEqual(common.fetch(self.model, self.model.file, digest), str(path.resolve()))
++
++    def test_missing_dataset_does_not_fall_back_to_a_network_download(self):
++        with patch.object(common, "INPUT_DIR", self.root), patch.dict(sys.modules, {"huggingface_hub": None}):
++            with self.assertRaises(FileNotFoundError):
++                common.fetch(self.model, self.model.file)
++
++    def test_checksum_mismatch_fails(self):
++        self.create_file("model")
++        with patch.object(common, "INPUT_DIR", self.root), self.assertRaisesRegex(RuntimeError, "sha256 mismatch"):
++            common.fetch(self.model, self.model.file, "0" * 64)
++
++    def test_paths_cannot_escape_inputs(self):
++        with patch.object(common, "INPUT_DIR", self.root):
++            for file in ("../outside.gguf", "/outside.gguf", "..\\outside.gguf"):
++                with self.subTest(file=file), self.assertRaises(ValueError):
++                    common.dataset_file("owner/model", file)
++            for dataset in ("../model", "owner/model/extra", ""):
++                with self.subTest(dataset=dataset), self.assertRaises(ValueError):
++                    common.dataset_file(dataset, "model.gguf")
++
++    def test_existing_hugging_face_download_behavior_is_preserved(self):
++        path = self.create_file("downloaded")
++        calls = []
++        module = types.ModuleType("huggingface_hub")
++        module.hf_hub_download = lambda *args, **kwargs: calls.append((args, kwargs)) or str(path)
++        model = dataclasses.replace(self.model, dataset=None, revision="pinned")
++        with patch.dict(sys.modules, {"huggingface_hub": module}):
++            self.assertEqual(common.fetch(model, model.file), str(path))
++        self.assertEqual(calls[0][1]["revision"], "pinned")
++
++    def test_identical_filenames_in_different_sources_are_fetched_separately(self):
++        other = dataclasses.replace(self.model, dataset="owner/other")
++        hf = dataclasses.replace(self.model, dataset=None)
++        compatible = dataclasses.replace(self.model, gguf_compat="elephant-1")
++        with patch.object(backends, "FETCHED", {}), patch.object(backends, "FETCH_LOCKS", {}), \
++                patch.object(backends, "fetch", side_effect=lambda model, file, digest: str((model.dataset, model.gguf_compat))) as fetch:
++            paths = [backends.model_files(model)[0] for model in (self.model, other, hf, compatible)]
++            backends.model_files(self.model)
++        self.assertEqual(len(set(paths)), 4)
++        self.assertEqual(fetch.call_count, 4)
++
++    def test_server_and_calibration_attach_dataset_but_build_does_not(self):
++        config = parse_config({
++            "kaggle": {"username": "tester", "llama_cpp_ref": "pinned"},
++            "models": {"first": dataclasses.asdict(self.model), "second": dataclasses.asdict(self.model)},
++        }, environ={})
++        for script in (kaggle.SERVER_SCRIPT, kaggle.CALIBRATE_SCRIPT, kaggle.BUILD_SCRIPT):
++            slug = script.removesuffix(".py")
++            with patch.object(kaggle, "STATE_DIR", self.root), patch.object(kaggle, "render", return_value="# test"), \
++                    patch.object(kaggle, "_cli", return_value=subprocess.CompletedProcess([], 0, "", "")):
++                kaggle.push(config, slug, script, {})
++            metadata = json.loads((self.root / slug / "kernel-metadata.json").read_text())
++            self.assertEqual(metadata["dataset_sources"], [] if script == kaggle.BUILD_SCRIPT else ["owner/model"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tests/test_gguf_compat.py
+@@ -0,0 +1,60 @@
++"""Use tiny GGUF-like fixtures, never real weights or network requests."""
++import hashlib
++import struct
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "kaggle"))
++import gguf_compat
++
++
++def fixture():
++    data = b"GGUF" + struct.pack("<IQQ", 3, 0, 3)
++    for key, value in ((b"qwen35.block_count", 33), (b"qwen35.nextn_predict_layers", 1)):
++        data += struct.pack("<Q", len(key)) + key + struct.pack("<II", 4, value)
++    key = b"qwen35.attention.recurrent_layers"
++    data += struct.pack("<Q", len(key)) + key + struct.pack("<IIQ", 9, 7, 33)
++    data += bytes([int((index + 1) % 4 != 0) for index in range(32)] + [0])
++    return data + b"synthetic-tensor-bytes" * 40
++
++
++class CompatibilityTests(unittest.TestCase):
++    def test_only_declared_metadata_bytes_change_and_original_is_preserved(self):
++        data = fixture()
++        digest = hashlib.sha256(data).hexdigest()
++        with tempfile.TemporaryDirectory() as folder, patch.object(gguf_compat, "ELEPHANT_SHA256", digest):
++            source = Path(folder) / "source.gguf"
++            source.write_bytes(data)
++            report = gguf_compat.elephant_compatible(source, Path(folder) / "cache", digest)
++            runtime = Path(report["runtime_file"]).read_bytes()
++            self.assertEqual(source.read_bytes(), data)
++            restored = bytearray(runtime)
++            for offset, old, new in gguf_compat._patches(data):
++                self.assertEqual(runtime[offset:offset + len(new)], new)
++                restored[offset:offset + len(old)] = old
++            self.assertEqual(restored, data)
++            self.assertEqual(len(runtime), len(data))
++            self.assertTrue(report["tensor_bytes_unchanged"])
++
++    def test_unknown_source_is_rejected_before_copy(self):
++        with self.assertRaises(RuntimeError):
++            gguf_compat.elephant_compatible(Path("absent.gguf"), Path("unused"), "0" * 64)
++
++    def test_corrupted_cached_copy_is_rejected(self):
++        data = fixture()
++        digest = hashlib.sha256(data).hexdigest()
++        with tempfile.TemporaryDirectory() as folder, patch.object(gguf_compat, "ELEPHANT_SHA256", digest):
++            source = Path(folder) / "source.gguf"
++            source.write_bytes(data)
++            report = gguf_compat.elephant_compatible(source, Path(folder) / "cache", digest)
++            target = Path(report["runtime_file"])
++            target.write_bytes(target.read_bytes()[:-1] + b"!")
++            with self.assertRaises(RuntimeError):
++                gguf_compat.elephant_compatible(source, Path(folder) / "cache", digest)
++
++
++if __name__ == "__main__":
++    unittest.main()
+--- /dev/null
++++ b/tests/test_cancellation.py
+@@ -0,0 +1,204 @@
++"""Decision cancellation across a buffering tunnel, without a model or GPU."""
++
++import asyncio
++import dataclasses
++import uuid
++
++import aiohttp
++import pytest
++from aiohttp import web
++from aiohttp.test_utils import TestServer
++from conftest import SECRETS, FakeBackends, make_balancer
++
++from kis import events, proxy
++
++AUTH = {"Authorization": "Bearer secret"}
++
++
++async def wait_until(predicate):
++    async with asyncio.timeout(3):
++        while not predicate():
++            await asyncio.sleep(0.01)
++
++
++class BufferingServer(TestServer):
++    async def _make_runner(self, **kwargs):
++        kwargs["handler_cancellation"] = False
++        return await super()._make_runner(**kwargs)
++
++
++async def slow_balancer(server, aiohttp_server, aiohttp_client, monkeypatch):
++    began, cancelled = asyncio.Event(), asyncio.Event()
++
++    async def decide(req):
++        await req.read()
++        began.set()
++        try:
++            await asyncio.Event().wait()
++        finally:
++            cancelled.set()
++        return web.json_response({"answers": {}})
++
++    backend_app = web.Application()
++    backend_app.router.add_post("/v1/systemone", decide)
++    backend = await aiohttp_server(backend_app)
++    balancer = make_balancer(server, FakeBackends({server.START: [backend.port]}, server.START))
++    monkeypatch.setattr(balancer, "settings", dataclasses.replace(balancer.settings, session="original-session"))
++    # Deliberately do not cancel this handler just because the tunnel disconnects.
++    cloud = BufferingServer(balancer.app())
++    await aiohttp_client(cloud)
++    return balancer, cloud, began, cancelled
++
++
++async def test_cancel_requires_auth_post_and_original_session(aiohttp_client, balancer):
++    client = await aiohttp_client(balancer.app())
++    request_id = uuid.uuid4().hex
++    query = {"session": balancer.settings.session, "request_id": request_id}
++    assert (await client.post("/admin/cancel", params=query)).status == 401
++    assert (await client.get("/admin/cancel", params=query, headers=AUTH)).status == 405
++    assert (await client.post("/admin/cancel", params={**query, "session": "replacement"}, headers=AUTH)).status == 409
++    assert not balancer.cancelled_ids
++    assert (await client.post("/admin/cancel", params={**query, "request_id": "bad"}, headers=AUTH)).status == 400
++
++
++async def test_cancel_before_arrival_prevents_late_work(aiohttp_client, balancer):
++    client = await aiohttp_client(balancer.app())
++    request_id = uuid.uuid4().hex
++    query = {"session": balancer.settings.session, "request_id": request_id}
++    for _ in range(2):
++        response = await client.post("/admin/cancel", params=query, headers=AUTH)
++        assert response.status == 200 and (await response.json())["status"] == "not_running"
++    response = await client.post("/v1/systemone", json={}, headers={**AUTH, "X-KIS-Request-ID": request_id})
++    assert response.status == 409
++    assert balancer.requests == 0 and not any(balancer.inflight.values())
++
++
++async def test_cancel_active_request_closes_backend_and_counters(server, aiohttp_server, aiohttp_client, monkeypatch):
++    balancer, cloud, began, cancelled = await slow_balancer(server, aiohttp_server, aiohttp_client, monkeypatch)
++    client = await aiohttp_client(cloud)
++    request_id = uuid.uuid4().hex
++    task = asyncio.create_task(client.post("/v1/systemone", json={}, headers={**AUTH, "X-KIS-Request-ID": request_id}))
++    await asyncio.wait_for(began.wait(), 3)
++    query = {"session": "original-session", "request_id": request_id}
++    for _ in range(2):
++        response = await client.post("/admin/cancel", params=query, headers=AUTH)
++        assert response.status == 200
++    await asyncio.wait_for(cancelled.wait(), 3)
++    await asyncio.gather(task, return_exceptions=True)
++    assert not balancer.request_tasks and balancer.waiting == 0
++    assert not any(balancer.inflight.values())
++
++
++async def test_duplicate_active_id_is_rejected(server, aiohttp_server, aiohttp_client, monkeypatch):
++    balancer, cloud, began, _ = await slow_balancer(server, aiohttp_server, aiohttp_client, monkeypatch)
++    client = await aiohttp_client(cloud)
++    request_id = uuid.uuid4().hex
++    headers = {**AUTH, "X-KIS-Request-ID": request_id}
++    task = asyncio.create_task(client.post("/v1/systemone", json={}, headers=headers))
++    await asyncio.wait_for(began.wait(), 3)
++    assert (await client.post("/v1/systemone", json={}, headers=headers)).status == 409
++    assert balancer.requests == 1
++    await client.post("/admin/cancel", params={"session": "original-session", "request_id": request_id}, headers=AUTH)
++    await asyncio.gather(task, return_exceptions=True)
++
++
++async def test_cancel_while_waiting_for_model_releases_waiting_count(aiohttp_client, balancer, monkeypatch):
++    waiting = asyncio.Event()
++
++    async def wait_for_model(_):
++        waiting.set()
++        await asyncio.Event().wait()
++
++    monkeypatch.setattr(balancer, "ensure", wait_for_model)
++    client = await aiohttp_client(balancer.app())
++    request_id = uuid.uuid4().hex
++    task = asyncio.create_task(client.post("/v1/systemone", json={}, headers={**AUTH, "X-KIS-Request-ID": request_id}))
++    await asyncio.wait_for(waiting.wait(), 3)
++    response = await client.post(
++        "/admin/cancel", params={"session": balancer.settings.session, "request_id": request_id}, headers=AUTH
++    )
++    assert response.status == 200
++    await asyncio.gather(task, return_exceptions=True)
++    assert balancer.waiting == 0 and not balancer.request_tasks
++
++
++async def test_proxy_cancels_original_session_even_after_endpoint_changes(
++    server, aiohttp_server, aiohttp_client, monkeypatch, config
++):
++    balancer, cloud, began, cancelled = await slow_balancer(server, aiohttp_server, aiohttp_client, monkeypatch)
++    url = str(cloud.make_url("")).rstrip("/")
++    current = events.Session("original-session", endpoint=url)
++    monkeypatch.setattr(events, "endpoint", lambda *_: url)
++    monkeypatch.setattr(events, "current", lambda *_: current)
++    local = await aiohttp_server(proxy.make_app(config, SECRETS))
++    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.25)) as client:
++
++        async def send():
++            async with client.post(
++                local.make_url("/v1/systemone"), json={}, headers={"X-KIS-Request-ID": "spoof"}
++            ) as response:
++                return await response.read()
++
++        task = asyncio.create_task(send())
++        await asyncio.wait_for(began.wait(), 3)
++        current = events.Session("replacement-session", endpoint="http://127.0.0.1:1")
++        with pytest.raises(TimeoutError):
++            await task
++    await asyncio.wait_for(cancelled.wait(), 3)
++    await wait_until(lambda: not balancer.request_tasks)
++    assert balancer.waiting == 0 and not any(balancer.inflight.values())
++    assert "spoof" not in balancer.cancelled_ids
++    assert len(balancer.cancelled_ids) == 1
++
++
++async def test_retry_cleans_previous_attempt_and_uses_unique_ids(aiohttp_server, aiohttp_client, monkeypatch, config):
++    order, ids = [], []
++
++    async def decide(req):
++        order.append("infer")
++        ids.append(req.headers["X-KIS-Request-ID"])
++        if len(ids) == 1:
++            return web.Response(status=502)
++        return web.json_response({"answers": {"q": {"score": 2}}})
++
++    async def cancel(req):
++        order.append("cancel")
++        assert req.headers["Authorization"] == "Bearer secret"
++        assert req.query["session"] == "old"
++        assert req.query["request_id"] == ids[0]
++        return web.json_response({"status": "not_running"})
++
++    app = web.Application()
++    app.router.add_post("/v1/systemone", decide)
++    app.router.add_post("/admin/cancel", cancel)
++    cloud = await aiohttp_server(app)
++    url = str(cloud.make_url("")).rstrip("/")
++    monkeypatch.setattr(events, "endpoint", lambda *_: url)
++    monkeypatch.setattr(events, "current", lambda *_: events.Session("old", endpoint=url))
++    client = await aiohttp_client(proxy.make_app(config, SECRETS))
++    response = await client.post("/v1/systemone", json={})
++    assert response.status == 200 and (await response.json())["answers"]["q"]["score"] == 2
++    assert order == ["infer", "cancel", "infer"]
++    assert len(set(ids)) == 2
++
++
++async def test_unconfirmed_cancellation_blocks_duplicate_gpu_work(aiohttp_server, aiohttp_client, monkeypatch, config):
++    count = 0
++
++    async def decide(req):
++        nonlocal count
++        count += 1
++        return web.Response(status=502)
++
++    app = web.Application()
++    app.router.add_post("/v1/systemone", decide)
++    app.router.add_post("/admin/cancel", lambda _: web.Response(status=503))
++    cloud = await aiohttp_server(app)
++    url = str(cloud.make_url("")).rstrip("/")
++    monkeypatch.setattr(events, "endpoint", lambda *_: url)
++    monkeypatch.setattr(events, "current", lambda *_: events.Session("old", endpoint=url))
++    client = await aiohttp_client(proxy.make_app(config, SECRETS))
++    response = await client.post("/v1/systemone", json={})
++    assert response.status == 502
++    assert "cancellation" in (await response.json())["error"]["message"]
++    assert count == 1

@@ -41,3 +41,21 @@ Upstream source: https://github.com/poco-ai/Agentero
 
 Original license and third-party notices are retained in the portable package.
 This is an independently adapted build, not an official Agentero release.
+
+## Companion KIS patch
+
+`patches/kis-cloud-support.patch` applies to KaggleInferenceServer commit
+`0d6fd399b6bfa075e96f69371f090159744d127d`. It adds mounted-dataset model access,
+the pinned Elephant metadata compatibility copy, and authenticated cancellation.
+
+Each forwarded decision attempt receives a fresh `X-KIS-Request-ID`. The internal
+`POST /admin/cancel?session=...&request_id=...` route is protected by the existing
+server key, rejects a different session, and is idempotent. Cancelled ids are held
+briefly to reject inference requests that arrive late through a buffering tunnel.
+An attempt is cleaned up before retrying; an unconfirmed cancellation blocks a
+duplicate retry. Decision audit records contain counts and timings only.
+
+`scripts/install_portable.py` verifies the archive, source/patch fingerprints and
+every resource before extracting into a versioned application directory.
+`scripts/launch_portable.py` backs up local settings privately and refuses to start
+while another Agentero instance is running. These scripts never upload settings.
